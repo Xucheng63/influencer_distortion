@@ -70,8 +70,8 @@ async def run_analysis(
     cookies = cookies or {}
 
     # ── Step 1: profile + posts (both request-cookie driven) ──────────────
-    info = await scraper.fetch_profile_info(handle, cookies=cookies)
-    raw_posts = await scraper.fetch_recent_posts(handle, cookies=cookies)
+    info = await scraper.fetch_profile_info(handle, cookies=cookies, platform=platform)
+    raw_posts = await scraper.fetch_recent_posts(handle, cookies=cookies, platform=platform)
     raw_posts = raw_posts[:max_posts]
     total = len(raw_posts)
     on_progress(0, total)

@@ -3,9 +3,10 @@ app/services/scraper.py  —  多平台抓取器 v2
 支持: RSS/Newsletter、YouTube字幕(yt-dlp)、Twitter/X API v2
 """
 from __future__ import annotations
-import hashlib, os, asyncio
+import hashlib, os, re, asyncio
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import unquote
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -216,14 +217,76 @@ async def _fetch_rss(url: str) -> list[dict]:
     return _parse_rss(xml)
 
 # ── YouTube（yt-dlp，免费）────────────────────────────────────────────────────
-async def _fetch_youtube(channel_id: str, max_videos: int = 20) -> list[dict]:
+# 频道 ID 形如 UC + 22 位。大小写敏感，所以调用方必须传未经 lower() 的原始字符串。
+_YT_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_YT_TABS = ("/videos", "/shorts", "/streams", "/featured", "/about",
+            "/playlists", "/community")
+
+
+def _is_youtube_ref(ref: str) -> bool:
+    """True for an explicit YouTube reference: a channel URL or a raw UC… id.
+
+    Deliberately narrow — a bare word like "veritasium" is NOT a YouTube ref,
+    since that would swallow Twitter/Substack handles. Bare names reach YouTube
+    only via FEED_MAP or an explicit platform="youtube" from the caller.
+    """
+    r = ref.strip()
+    if _YT_ID_RE.match(r):
+        return True
+    low = r.lower()
+    return "youtube.com/" in low or "youtu.be/" in low
+
+
+def _youtube_target(ref: str) -> str:
+    """Normalize any YouTube reference to a channel /videos listing URL.
+
+    Accepts a UC… channel id, a full channel URL (@handle / channel / user /
+    legacy c/ forms, with or without a trailing tab), or a bare @handle.
+    """
+    r = ref.strip().rstrip("/")
+    low = r.lower()
+
+    if "youtube.com/" in low or "youtu.be/" in low:
+        if not low.startswith(("http://", "https://")):
+            r = "https://" + r
+        # Replace whatever tab was given with /videos.
+        for tab in _YT_TABS:
+            if r.lower().endswith(tab):
+                r = r[: -len(tab)]
+                break
+        return r + "/videos"
+
+    if _YT_ID_RE.match(r):
+        return f"https://www.youtube.com/channel/{r}/videos"
+
+    return f"https://www.youtube.com/@{r.lstrip('@')}/videos"
+
+
+def _youtube_refs(key: str, channel_id: str = "") -> list[str]:
+    """Resolution order for a FEED_MAP YouTube entry: the registry key as an
+    @handle first, the stored channel id second.
+
+    Most stored ids have gone stale and now resolve to unrelated channels
+    (mkbhd → "Gartner for Marketing"), while the registry key still matches the
+    real @handle — so the handle wins and the id is only a fallback, which
+    still covers keys that are not valid handles (e.g. "andreijikh2").
+    """
+    refs = [f"@{key.lstrip('@')}"]
+    if channel_id and channel_id not in refs:
+        refs.append(channel_id)
+    return refs
+
+
+async def _fetch_youtube(ref: str, max_videos: int = 20) -> list[dict]:
+    """Recent videos + transcripts for a channel. `ref` is anything
+    _youtube_target() accepts: a UC… id, a channel URL, or a bare handle."""
     try:
         import yt_dlp  # type: ignore
     except ImportError:
         print("[scraper] yt-dlp not installed. Run: pip install yt-dlp")
         return []
 
-    channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    channel_url = _youtube_target(ref)
     list_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": max_videos}
 
     try:
@@ -396,6 +459,112 @@ def _make_twitter_context(p, cookies: dict[str, str]):
     return browser, context
 
 
+# 时间轴就绪探针：一次 evaluate 同时取回 article 与 tweetText 数量，
+# 避免分多次 eval 造成计数取自不同时刻。
+_TIMELINE_PROBE_JS = """
+    () => ({
+        articles:   document.querySelectorAll('article').length,
+        tweetTexts: document.querySelectorAll('[data-testid="tweetText"]').length,
+    })
+"""
+
+# article 已出现、但迟迟等不到 tweetText 时的宽限期（毫秒）。
+# 超过这个时间仍无正文，就认为顶部是纯媒体推文，不再干等。
+_TIMELINE_GRACE_MS = 8000
+
+
+def _timeline_state(articles: int, tweet_texts: int, ms_since_articles: float) -> str:
+    """
+    根据 DOM 计数判定时间轴是否就绪，返回：
+      ready_text       —— 已渲染出推文正文，最理想
+      ready_media_only —— article 已渲染但没有正文：顶部若全是纯图/纯视频推文，
+                          [data-testid="tweetText"] 永远不会出现（实测
+                          @realDonaldTrump 顶部 5 条均为视频推文），
+                          此时应当就绪放行，交给后续滚动收割去找带正文的推文
+      not_ready        —— 时间轴尚未渲染，继续等
+    """
+    if tweet_texts > 0:
+        return "ready_text"
+    if articles > 0 and ms_since_articles >= _TIMELINE_GRACE_MS:
+        return "ready_media_only"
+    return "not_ready"
+
+
+def _wait_twitter_timeline(page, username: str, timeout_ms: int = 45000) -> str:
+    """
+    等待 X 时间轴就绪，返回 _timeline_state 的状态字符串。
+
+    旧实现死等 [data-testid="tweetText"]：顶部全是纯媒体推文时该选择器永不出现，
+    每次都白等满 45s 再打印一条「wait timeout」假告警。改为轮询计数 +
+    宽限期判定，纯媒体顶部只需 ~8s 即可放行，且日志能区分真假异常。
+    """
+    import time as _time
+
+    deadline = _time.time() + timeout_ms / 1000
+    first_article_at: float | None = None
+    articles = tweet_texts = 0
+    state = "not_ready"
+
+    while True:
+        try:
+            counts = page.evaluate(_TIMELINE_PROBE_JS)
+            articles = int(counts.get("articles", 0))
+            tweet_texts = int(counts.get("tweetTexts", 0))
+        except Exception:
+            articles = tweet_texts = 0
+
+        if articles > 0 and first_article_at is None:
+            first_article_at = _time.time()
+        since = (_time.time() - first_article_at) * 1000 if first_article_at else 0.0
+
+        state = _timeline_state(articles, tweet_texts, since)
+        if state != "not_ready" or _time.time() >= deadline:
+            break
+        _time.sleep(0.5)
+
+    if state == "ready_text":
+        print(f"[scraper] Twitter @{username}: timeline ready — "
+              f"articles={articles} tweetText={tweet_texts}")
+    elif state == "ready_media_only":
+        print(f"[scraper] Twitter @{username}: timeline ready, top posts have no text "
+              f"(media-only) — articles={articles}; will harvest text while scrolling")
+    else:
+        # 真正的异常：时间轴始终没渲染出任何 article，附带 body 片段便于排查
+        try:
+            _body = (page.inner_text("body") or "")[:200].replace("\n", " ")
+        except Exception as _e:
+            _body = f"<body read failed: {_e}>"
+        print(f"[scraper] Twitter @{username}: timeline did not render within "
+              f"{timeout_ms}ms — articles={articles} tweetText={tweet_texts} "
+              f"body_snippet={_body!r} — continuing anyway")
+    return state
+
+
+def _newest_article_date(dates: list[str]) -> str:
+    """
+    从时间轴上所有 article 的 datetime 里挑出最新的一个。
+
+    不能直接取第一条 article 的日期当「最新」：置顶推文（以及推广内容）会排在
+    时间轴最前面，日期可能是几年前的，会把新鲜的时间轴误判成过时、白白触发
+    一次整页重载（重载后置顶推依然在最前，判定不会改变）。取最大值则与
+    排列顺序无关，置顶/推广都不会拉低结果。
+
+    无法解析的日期直接跳过；全都无效时返回空串。
+    """
+    newest = ""
+    newest_dt = None
+    for iso in dates or []:
+        if not iso:
+            continue
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+        if newest_dt is None or dt > newest_dt:
+            newest_dt, newest = dt, iso
+    return newest
+
+
 def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int = 50) -> list[dict]:
     """
     用 Playwright 浏览器 + Cookie 抓取推文。
@@ -441,22 +610,10 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
                       f"(redirected to {page.url!r}) — cookie likely invalid or IP blocked")
                 return []
 
-            # 等待推文元素出现。按 [data-testid="tweetText"]（推文正文标记）等待，
-            # 比 article[data-testid="tweet"]（文章级 testid）更稳定；Render 实例
-            # 较慢，时间轴 hydration 需要更久，超时放宽到 45s。
-            try:
-                page.wait_for_selector('[data-testid="tweetText"]', timeout=45000)
-            except Exception:
-                # 诊断：即便超时也不直接放弃——记录现状后继续滚动收割，
-                # 时间轴可能在滚动/再等一会儿后才补齐。
-                try:
-                    _arts = page.eval_on_selector_all("article", "els => els.length")
-                    _tt = page.eval_on_selector_all('[data-testid="tweetText"]', "els => els.length")
-                    _body = (page.inner_text("body") or "")[:200].replace("\n", " ")
-                except Exception as _e:
-                    _arts, _tt, _body = "?", "?", f"<body read failed: {_e}>"
-                print(f"[scraper] Twitter @{username}: tweetText wait timeout — "
-                      f"articles={_arts} tweetText={_tt} body_snippet={_body!r} — continuing anyway")
+            # 等待时间轴就绪。不能只等 [data-testid="tweetText"]：顶部若是
+            # 纯图/纯视频推文，该选择器永远不出现，会白等满超时。Render 实例
+            # 较慢，hydration 需要更久，总超时保持 45s。
+            _wait_twitter_timeline(page, username, timeout_ms=45000)
             _time.sleep(2)
 
             # ── 强制加载最新推文 ────────────────────────────────────────────
@@ -465,15 +622,16 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
             # 这里：点掉横幅 → 滚回顶部 → 若顶部推文仍很旧则整页重载一次，
             # 尽量让时间轴呈现最新推文。
             def _top_date():
+                # 读取当前 DOM 内所有 article 的 datetime，取最新的一条。
+                # 只看第一条会被置顶推文带偏（详见 _newest_article_date）。
                 try:
-                    return page.evaluate(
-                        """() => {
-                            const t = document.querySelector('article time');
-                            return t ? (t.getAttribute('datetime') || '') : '';
-                        }"""
-                    ) or ""
+                    dates = page.evaluate(
+                        """() => [...document.querySelectorAll('article time')]
+                                 .map(t => t.getAttribute('datetime') || '')"""
+                    ) or []
                 except Exception:
                     return ""
+                return _newest_article_date(dates)
 
             def _click_see_new_posts():
                 # 「See new posts」/「Show new posts」按钮：点击后加载最新推文
@@ -517,7 +675,7 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
                 print(f"[scraper] Twitter @{username}: timeline looks stale, reloading")
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=120000)
-                    page.wait_for_selector('[data-testid="tweetText"]', timeout=45000)
+                    _wait_twitter_timeline(page, username, timeout_ms=45000)
                     _time.sleep(2)
                 except Exception:
                     pass
@@ -526,8 +684,8 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
             # 旧逻辑「先滚动 6 次再一次性提取」只会拿到较旧的推文，丢失最新几条。
             # 修复：边滚边累积——每次滚动后立即提取当前 DOM 内的推文并按 url 去重。
             # 以 [data-testid="tweetText"]（推文正文）为锚点，向上找到所属 article。
-            # 不再依赖 article 自身的 data-testid="tweet"——X 的 DOM 结构时有变动，
-            # 而 tweetText 标记更稳定（Render 上实测 article 级 testid 未命中）。
+            # 无正文的纯媒体推文本就没有 tweetText，这里自然跳过——它们没有可分析
+            # 的文本，不计入结果；带正文的推文会在滚动过程中逐步进入 DOM 被收割。
             _EXTRACT_JS = """
                 () => {
                     const out = [];
@@ -757,46 +915,74 @@ async def _get_twitter_info(handle: str, cookies: dict[str, str] | None = None) 
     }
 
 
-async def _get_youtube_info(handle: str) -> dict:
+async def _get_youtube_info(handle: str, ref: str | None = None) -> dict:
     """YouTube 频道档案（显示名 + 订阅数）。channel_id 存于 FEED_MAP['feed']。
 
     复用 yt-dlp：频道 extract_info 顶层含 channel_follower_count（订阅数）。
     任何失败都回退到 FEED_MAP 里的显示名 + followers=0（不抛异常）。
+
+    `ref` is the caller's original (non-lowercased) handle, used for channels
+    that are not in FEED_MAP — a channel URL or a raw UC… id.
     """
     entry = FEED_MAP.get(handle, {})
     channel_id = entry.get("feed", "")
     display = entry.get("display", handle)
     followers = 0
+
     try:
         import yt_dlp  # type: ignore
-        channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
-        opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 1}
-        loop = asyncio.get_event_loop()
-        def _info():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(channel_url, download=False)
-        info = await loop.run_in_executor(None, _info)
-        followers = info.get("channel_follower_count") or 0
-        display = info.get("channel") or info.get("uploader") or display
     except ImportError:
         print("[scraper] yt-dlp not installed; YouTube followers unavailable")
-    except Exception as e:
-        print(f"[scraper] YouTube info error for {handle}: {e}")
+        return {"handle": handle, "display_name": display, "followers": followers}
+
+    # Registry entries prefer the key-as-@handle; arbitrary channels use the
+    # caller's own reference. Same order as fetch_recent_posts, so the profile
+    # and the posts always describe the same channel.
+    refs = _youtube_refs(handle, channel_id) if entry else [ref or handle]
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 1}
+    loop = asyncio.get_event_loop()
+
+    for r in refs:
+        channel_url = _youtube_target(r)
+        try:
+            def _info(url=channel_url):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            info = await loop.run_in_executor(None, _info)
+        except Exception as e:
+            print(f"[scraper] YouTube info error for {r}: {e}")
+            continue
+        followers = info.get("channel_follower_count") or 0
+        display = info.get("channel") or info.get("uploader") or display
+        break
+
     return {"handle": handle, "display_name": display, "followers": followers}
 
 # ── 公开入口 ───────────────────────────────────────────────────────────────────
-async def fetch_profile_info(handle: str, cookies: dict[str, str] | None = None) -> dict:
+async def fetch_profile_info(
+    handle: str, cookies: dict[str, str] | None = None, platform: str | None = None
+) -> dict:
     cookies = cookies or {}
-    handle = handle.lower().strip()
+    # Channel ids are case-sensitive, so keep the original alongside the
+    # lowercased key used for FEED_MAP and the platform detectors.
+    handle_raw = handle.strip().lstrip("@").strip()
+    handle = handle_raw.lower()
     if handle in FEED_MAP:
         entry = FEED_MAP[handle]
         # YouTube 频道有订阅数，单独抓取；RSS 无粉丝概念，保持 0。
         if entry.get("type") == "youtube":
             return await _get_youtube_info(handle)
+
+    # 微博：weibo/{uid}、数字 uid、weibo.com 链接，或 UI 指定 weibo 时的昵称。
+    if _is_weibo_ref(handle_raw) or (platform or "").lower() == "weibo":
+        return await _get_weibo_info(handle_raw, cookies=cookies)
+
+    # 任意 YouTube 频道（不在 FEED_MAP 中）：显式 URL / UC… id，或 UI 指定 youtube。
+    if handle not in FEED_MAP and (
+        _is_youtube_ref(handle_raw) or (platform or "").lower() == "youtube"
+    ):
+        return await _get_youtube_info(handle, ref=handle_raw)
         return {"handle": handle, "display_name": entry["display"], "followers": 0}
-    # 微博：weibo/{uid}
-    if _is_weibo(handle):
-        return await _get_weibo_info(handle)
     # Reddit subreddit 或 user
     if _is_reddit(handle):
         return await _get_reddit_info(handle)
@@ -864,21 +1050,33 @@ async def _fetch_substack_fulltext(handle: str, max_posts: int = 20) -> list[dic
 
 
 async def fetch_recent_posts(
-    handle: str, cookies: dict[str, str] | None = None, max_pages: int = 3
+    handle: str,
+    cookies: dict[str, str] | None = None,
+    max_pages: int = 3,
+    platform: str | None = None,
 ) -> list[dict]:
     """Dispatch a recent-posts fetch by handle.
 
     `cookies` are the per-request credentials for the authenticated platforms
     (twitter → {auth_token, ct0}; weibo → {sub, subp}). Keyless platforms
     (RSS/YouTube/Reddit/Bluesky) ignore them.
+
+    `platform` is the caller's declared platform. Dispatch is still handle-led;
+    it is only consulted to send a bare handle to YouTube, which is otherwise
+    indistinguishable from a Twitter/Substack name.
     """
     cookies = cookies or {}
-    handle = handle.lower().strip()
+    # Channel ids are case-sensitive, so keep the original alongside the
+    # lowercased key used for FEED_MAP and the platform detectors.
+    handle_raw = handle.strip().lstrip("@").strip()
+    handle = handle_raw.lower()
 
-    # ── 微博：weibo/{uid} ────────────────────────────────────────────────────
-    if _is_weibo(handle):
-        uid = handle.split("/")[1]
-        return await _fetch_weibo(uid, cookies=cookies, max_posts=50)
+    # ── 微博 ────────────────────────────────────────────────────────────────
+    # weibo/{uid}、数字 uid、weibo.com/m.weibo.cn 链接，或 UI 选定 weibo 时的昵称
+    # （昵称先经 resolve_weibo_uid 解析成 uid）。
+    if _is_weibo_ref(handle_raw) or (platform or "").lower() == "weibo":
+        uid = await resolve_weibo_uid(_weibo_query(handle_raw), cookies=cookies)
+        return await _fetch_weibo(uid, cookies=cookies, max_posts=50) if uid else []
 
     # ── Reddit subreddit 或 user ───────────────────────────────────────────────
     if _is_reddit(handle):
@@ -886,6 +1084,17 @@ async def fetch_recent_posts(
             return await _fetch_reddit_subreddit(handle[2:], max_posts=50)
         elif handle.startswith("u/"):
             return await _fetch_reddit_user(handle[2:], max_posts=50)
+
+    # ── 任意 YouTube 频道 ─────────────────────────────────────────────────────
+    # Must precede the Bluesky branch: _is_bluesky() matches any dotted string,
+    # so "youtube.com/@x" would otherwise be taken for a Bluesky handle. Falls
+    # through on an empty result, leaving the existing fallbacks intact.
+    if handle not in FEED_MAP and (
+        _is_youtube_ref(handle_raw) or (platform or "").lower() == "youtube"
+    ):
+        posts = await _fetch_youtube(handle_raw, max_videos=20)
+        if posts:
+            return posts
 
     # ── Bluesky 账号 ──────────────────────────────────────────────────────────
     if _is_bluesky(handle) and handle not in FEED_MAP:
@@ -895,9 +1104,11 @@ async def fetch_recent_posts(
     if handle in FEED_MAP:
         entry = FEED_MAP[handle]
         if entry["type"] == "youtube":
-            posts = await _fetch_youtube(entry["feed"], max_videos=20)
-            if posts:
-                return posts
+            # @handle first, stored channel id second — see _youtube_refs().
+            for ref in _youtube_refs(handle, entry["feed"]):
+                posts = await _fetch_youtube(ref, max_videos=20)
+                if posts:
+                    return posts
             yt_rss = f"https://www.youtube.com/feeds/videos.xml?channel_id={entry['feed']}"
             return (await _fetch_rss(yt_rss))[:20]
         elif entry["type"] == "bluesky":
@@ -1038,11 +1249,14 @@ FEED_MAP.update({
     "veritasium":        {"feed": "UCHnyfMqiRRG1u-2MsSQLbXA",  "display": "Veritasium",   "type": "youtube"},
     "andrewhuang":       {"feed": "UCddiUEpeqJcYeBxX1IVBKvQ",  "display": "Andrew Huang", "type": "youtube"},
     "coldusion":         {"feed": "UC4QZ_LsYcvcq7qOsOhpAX4A",  "display": "ColdFusion",   "type": "youtube"},
-    "nandoogaming":      {"feed": "UCo8bcnLyZH8tBIH9V1mLgqQ",  "display": "Nando Gaming",     "type": "youtube"},
+    # 频道显示名是 "Nand0"，handle 是 @Nandoogaming。
+    "nandoogaming":      {"feed": "UCHbc40EdrL3X7UqUoqiaYxQ",  "display": "Nando Gaming",     "type": "youtube"},
     # ── Batch2 新增 YouTube 频道 ──────────────────────────────────────────
     "cgpgrey":           {"feed": "UC2C_jShtL725hvbm1arSV9w",  "display": "CGP Grey",          "type": "youtube"},
     "grahamstephan":     {"feed": "UCV6KDgJskWaEckne5aPA0aQ",  "display": "Graham Stephan",    "type": "youtube"},
-    "nandomovies":       {"feed": "UCo8bcnLyZH8tBIH9V1mLgqQ",  "display": "Nando v Movies",   "type": "youtube"},
+    # 真实 handle 是 @NandovMovies（非 @nandomovies，后者没有 videos tab），
+    # 所以 @handle 解析会失败，回退到这里的 channel id。
+    "nandomovies":       {"feed": "UCf29Sq6-XxLQG_XuJwMHaFg",  "display": "Nando v Movies",   "type": "youtube"},
     "linustechtips":     {"feed": "UCXuqSBlHAE6Xw-yeJA0Tunw",  "display": "Linus Tech Tips",  "type": "youtube"},
     "markrober":         {"feed": "UC7cs8q-gJRlGwj4A8OmCmXg",  "display": "Mark Rober",        "type": "youtube"},
     "teded":             {"feed": "UCY1kMZp36IQSyNx_9h4mpCg",  "display": "TED-Ed",            "type": "youtube"},
@@ -1198,9 +1412,34 @@ async def _fetch_bluesky(handle: str, max_posts: int = 50) -> list[dict]:
 # ── Weibo Playwright 抓取（移动端 API，无需登录）──────────────────────────────
 # handle 格式：weibo/{uid}，例如 weibo/2803301701
 
+# weibo.com/u/{uid}、weibo.com/{uid}、m.weibo.cn/u/{uid}、weibo.cn/n/{昵称}
+_WEIBO_URL_RE = re.compile(r"(?:^|//)(?:www\.|m\.)?weibo\.(?:com|cn)/(?:u/|n/)?([^/?#]+)", re.I)
+
+
 def _is_weibo(handle: str) -> bool:
     """判断是否是微博账号"""
     return handle.lower().startswith("weibo/")
+
+
+def _is_weibo_ref(handle_raw: str) -> bool:
+    """True for anything unambiguously Weibo: weibo/{uid} or a weibo.com /
+    m.weibo.cn profile URL. A bare screen name is NOT one of these — it is
+    indistinguishable from a Twitter/Substack name, so it only reaches Weibo
+    when the caller's `platform` says so.
+    """
+    h = handle_raw.strip()
+    return _is_weibo(h) or bool(_WEIBO_URL_RE.search(h))
+
+
+def _weibo_query(handle_raw: str) -> str:
+    """The uid or screen name to look up, extracted from any accepted Weibo ref."""
+    h = handle_raw.strip()
+    if _is_weibo(h):
+        return h.split("/", 1)[1].strip()
+    m = _WEIBO_URL_RE.search(h)
+    if m:
+        return unquote(m.group(1)).strip()
+    return h
 
 
 def _clean_weibo_text(raw: str) -> str:
@@ -1418,15 +1657,65 @@ async def _fetch_weibo(uid: str, cookies: dict[str, str], max_posts: int = 50) -
     return await loop.run_in_executor(None, _scrape_weibo_sync, uid, cookies, max_posts)
 
 
-async def resolve_weibo_uid(name_or_uid: str) -> str | None:
+async def _resolve_weibo_uid_desktop(name: str, cookies: dict[str, str]) -> str | None:
+    """Resolve a screen name via the logged-in desktop search endpoint."""
+    jar = {"SUB": (cookies.get("sub") or "").strip()}
+    subp = (cookies.get("subp") or "").strip()
+    if subp:
+        jar["SUBP"] = subp
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://weibo.com/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            r = await client.get(
+                "https://weibo.com/ajax/side/search",
+                params={"q": name},
+                headers=headers,
+                cookies=jar,
+                follow_redirects=True,
+            )
+            if r.status_code != 200:
+                return None
+            users = ((r.json() or {}).get("data") or {}).get("users") or []
+    except Exception as e:
+        print(f"[scraper] resolve_weibo_uid desktop({name!r}): {e}")
+        return None
+
+    # Search is fuzzy — "环球时报" also returns "环球时报文娱", a different
+    # account — so an exact screen-name match wins over ranking.
+    for u in users:
+        if (u.get("screen_name") or "").strip() == name and u.get("id"):
+            return str(u["id"])
+    return str(users[0]["id"]) if users and users[0].get("id") else None
+
+
+async def resolve_weibo_uid(
+    name_or_uid: str, cookies: dict[str, str] | None = None
+) -> str | None:
     """Resolve a Weibo username to a numeric UID.
 
-    If name_or_uid is already numeric, return it unchanged.
-    Otherwise search via m.weibo.cn/api/container/getIndex and return the
-    first matching user's UID, or None if not found.
+    If name_or_uid is already numeric, return it unchanged. Otherwise search —
+    first through the logged-in desktop endpoint, then through m.weibo.cn —
+    and return the matching user's UID, or None if not found.
     """
+    name_or_uid = (name_or_uid or "").strip()
+    if not name_or_uid:
+        return None
     if name_or_uid.isdigit():
         return name_or_uid
+
+    # Preferred path. The anonymous m.weibo.cn search below is behind the Sina
+    # Visitor System and now answers with an HTML bounce page for every query,
+    # so it only resolves anything when it is not actually needed. Kept as a
+    # fallback in case the cookies are absent or stale.
+    cookies = cookies or cookies_for_platform("weibo")
+    if (cookies.get("sub") or "").strip():
+        uid = await _resolve_weibo_uid_desktop(name_or_uid, cookies)
+        if uid:
+            return uid
 
     import json as _json
     from urllib.parse import quote as _quote
@@ -1532,9 +1821,11 @@ def _scrape_weibo_info_sync(uid: str) -> dict:
     return info
 
 
-async def _get_weibo_info(handle: str) -> dict:
+async def _get_weibo_info(handle: str, cookies: dict[str, str] | None = None) -> dict:
     """获取微博账号基本信息（昵称 + 粉丝数，UID 为标识）。"""
-    uid = handle.split("/")[1] if "/" in handle else handle
+    uid = await resolve_weibo_uid(_weibo_query(handle), cookies=cookies)
+    if not uid:
+        return {"handle": handle, "display_name": handle, "followers": 0}
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _scrape_weibo_info_sync, uid)
     return {
@@ -1550,6 +1841,103 @@ REDDIT_HEADERS = {
     "Accept": "application/json",
 }
 REDDIT_API = "https://www.reddit.com"
+
+# Reddit serves this placeholder as the body of rich-media posts; it is filler,
+# not content, and classifying it produces noise.
+_REDDIT_SELFTEXT_NOISE = re.compile(
+    r"this post contains content not supported on old reddit", re.I
+)
+_REDDIT_DEAD_BODY = {"[removed]", "[deleted]"}
+_URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$")
+
+# Text budget per post. Titles alone are often a few words ("AAPL 📈"), which is
+# far too little for the classifier to judge, so the body and the top comments
+# are what give a Reddit post enough text to score.
+_REDDIT_SELFTEXT_CHARS = 600
+_REDDIT_COMMENT_CHARS = 280
+_REDDIT_MAX_COMMENTS = 5
+_REDDIT_CONTENT_CHARS = 1500
+
+
+def _reddit_clean_selftext(raw: str) -> str:
+    """A post body with Reddit's own placeholders stripped, else ""."""
+    t = (raw or "").strip()
+    if not t or t in _REDDIT_DEAD_BODY or _REDDIT_SELFTEXT_NOISE.search(t):
+        return ""
+    return t
+
+
+def _reddit_top_comments(
+    payload, max_comments: int = _REDDIT_MAX_COMMENTS
+) -> list[str]:
+    """Highest-scoring human comments from a post's `.json` payload.
+
+    The payload is `[post_listing, comment_listing]` — the comment half is what
+    the caller already downloaded and used to discard. Reddit's default ordering
+    is not by score, so sort here rather than trusting it. Skips `more` stubs,
+    stickied mod posts, AutoModerator, removed bodies, and image-only replies:
+    none carry text worth classifying.
+    """
+    if not isinstance(payload, list) or len(payload) < 2:
+        return []
+    children = ((payload[1] or {}).get("data") or {}).get("children") or []
+    scored: list[tuple[int, str]] = []
+    for c in children:
+        if c.get("kind") != "t1":
+            continue
+        d = c.get("data") or {}
+        body = (d.get("body") or "").strip()
+        if (
+            not body
+            or body in _REDDIT_DEAD_BODY
+            or d.get("stickied")
+            or d.get("author") == "AutoModerator"
+            or _URL_ONLY_RE.match(body)
+        ):
+            continue
+        scored.append((d.get("score") or 0, body))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [b[:_REDDIT_COMMENT_CHARS] for _, b in scored[:max_comments]]
+
+
+def _reddit_content(title: str, selftext: str, comments: list[str]) -> str:
+    """Assemble one post's classifiable text from title, body and comments."""
+    parts = [(title or "").strip()]
+    body = _reddit_clean_selftext(selftext)
+    if body:
+        parts.append(body[:_REDDIT_SELFTEXT_CHARS])
+    if comments:
+        parts.append("Top comments: " + " | ".join(comments))
+    # Titles usually end in their own punctuation; don't add a second period.
+    joined = ""
+    for part in (p for p in parts if p):
+        if joined:
+            joined += " " if joined[-1] in ".!?…" else ". "
+        joined += part
+    return joined[:_REDDIT_CONTENT_CHARS]
+
+
+def _reddit_detail_sync(page, post_url: str) -> tuple[str, list[str]]:
+    """One post's body and top comments, via its `.json` endpoint (Playwright).
+
+    Body and comments arrive in the same response, so the comments cost no extra
+    request — the previous code fetched them and read only the post half.
+    """
+    import json as _json
+    import time as _time
+
+    try:
+        page.goto(f"{post_url}.json?sort=top&limit=50", timeout=12000)
+        _time.sleep(1)
+        payload = _json.loads(page.evaluate("() => document.body.innerText"))
+    except Exception:
+        return "", []
+    try:
+        selftext = payload[0]["data"]["children"][0]["data"].get("selftext", "") or ""
+    except Exception:
+        selftext = ""
+    return _reddit_clean_selftext(selftext), _reddit_top_comments(payload)
+
 
 def _is_reddit(handle: str) -> bool:
     """判断是否是 Reddit 来源（r/subreddit 或 u/username）"""
@@ -1593,9 +1981,9 @@ async def _fetch_reddit_subreddit_json(subreddit: str, max_posts: int = 50) -> l
             for child in children:
                 post = child.get("data", {})
                 title = post.get("title", "").strip()
-                selftext = post.get("selftext", "").strip()
-                # 合并标题和正文前300字
-                content = f"{title}. {selftext[:300]}" if selftext and selftext != "[removed]" else title
+                # Comments need a second request per post; this path is only the
+                # 403 fallback, so it settles for title + body.
+                content = _reddit_content(title, post.get("selftext", ""), [])
                 if not content.strip():
                     continue
 
@@ -1607,7 +1995,7 @@ async def _fetch_reddit_subreddit_json(subreddit: str, max_posts: int = 50) -> l
 
                 posts.append({
                     "platform_id": post_id or hashlib.md5(content[:100].encode()).hexdigest()[:12],
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": url,
                 })
@@ -1662,8 +2050,7 @@ async def _fetch_reddit_user_json(username: str, max_posts: int = 50) -> list[di
             for child in children:
                 post = child.get("data", {})
                 title = post.get("title", "").strip()
-                selftext = post.get("selftext", "").strip()
-                content = f"{title}. {selftext[:300]}" if selftext and selftext != "[removed]" else title
+                content = _reddit_content(title, post.get("selftext", ""), [])
                 if not content.strip():
                     continue
 
@@ -1675,7 +2062,7 @@ async def _fetch_reddit_user_json(username: str, max_posts: int = 50) -> list[di
 
                 posts.append({
                     "platform_id": post_id or hashlib.md5(content[:100].encode()).hexdigest()[:12],
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": url,
                 })
@@ -1876,26 +2263,15 @@ def _scrape_subreddit_sync(subreddit: str, max_posts: int = 50) -> list[dict]:
                 except Exception:
                     posted_dt = datetime.utcnow()
 
-                # 抓取帖子正文（访问详情页，读取 selftext）
-                selftext = ""
+                # 帖子正文 + 高分评论（同一个 .json 响应，评论不额外花请求）
+                selftext, comments = ("", [])
                 if post_url:
-                    try:
-                        page.goto(post_url + ".json", timeout=8000)
-                        time.sleep(1)
-                        body = page.evaluate("() => document.body.innerText")
-                        import json as _json
-                        data = _json.loads(body)
-                        selftext = data[0]["data"]["children"][0]["data"].get("selftext", "") or ""
-                        selftext = selftext.strip()
-                        if selftext in ("[removed]", "[deleted]"):
-                            selftext = ""
-                    except Exception:
-                        selftext = ""
+                    selftext, comments = _reddit_detail_sync(page, post_url)
 
-                content = f"{title}. {selftext[:300]}" if selftext else title
+                content = _reddit_content(title, selftext, comments)
                 posts.append({
                     "platform_id": pid,
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": post_url or None,
                 })
@@ -1998,26 +2374,16 @@ def _scrape_reddit_user_sync(username: str, max_posts: int = 50) -> list[dict]:
                 except Exception:
                     posted_dt = datetime.utcnow()
 
-                # 抓取帖子正文
+                # 帖子正文（用户自己的文字）。他人在其帖子下的评论不计入该用户的
+                # 失真分数——那是别人写的；用户自己的评论另行抓取，见 _fetch_reddit_user。
                 selftext = ""
                 if post_url:
-                    try:
-                        page.goto(post_url + ".json", timeout=8000)
-                        time.sleep(1)
-                        body = page.evaluate("() => document.body.innerText")
-                        import json as _json
-                        data = _json.loads(body)
-                        selftext = data[0]["data"]["children"][0]["data"].get("selftext", "") or ""
-                        selftext = selftext.strip()
-                        if selftext in ("[removed]", "[deleted]"):
-                            selftext = ""
-                    except Exception:
-                        selftext = ""
+                    selftext, _ = _reddit_detail_sync(page, post_url)
 
-                content = f"{title}. {selftext[:300]}" if selftext else title
+                content = _reddit_content(title, selftext, [])
                 posts.append({
                     "platform_id": pid,
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": post_url or None,
                 })
@@ -2042,6 +2408,70 @@ async def _fetch_reddit_subreddit(subreddit: str, max_posts: int = 50) -> list[d
     return posts
 
 
+def _scrape_reddit_user_comments_sync(username: str, max_items: int = 50) -> list[dict]:
+    """A user's own comments, from /user/{name}/comments.json (Playwright).
+
+    Their comments are their own words, so they belong in their distortion score
+    — unlike the replies *other* people leave on their posts, which is why
+    `_scrape_reddit_user_sync` drops those. Many accounts comment far more than
+    they post, so for them this is most of the signal.
+    """
+    import json as _json
+    import time as _time
+    from playwright.sync_api import sync_playwright
+
+    out: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[*CHROMIUM_LEAN_ARGS, "--disable-blink-features=AutomationControlled"],
+        )
+        page = browser.new_page(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ))
+        try:
+            # Load the HTML page first. Reddit answers a cold `.json` request with
+            # its JS anti-bot challenge page, not JSON; clearing the challenge here
+            # puts the cookie on the context so the `.json` fetch below succeeds.
+            html_url = f"https://www.reddit.com/user/{username}/comments/"
+            page.goto(html_url, wait_until="networkidle", timeout=45000)
+            if _reddit_page_is_login_wall(page) and _reddit_login(page):
+                page.goto(html_url, wait_until="networkidle", timeout=45000)
+            page.goto(
+                f"https://www.reddit.com/user/{username}/comments.json"
+                f"?sort=new&limit={min(100, max_items)}",
+                timeout=20000,
+            )
+            _time.sleep(1)
+            payload = _json.loads(page.evaluate("() => document.body.innerText"))
+            children = ((payload or {}).get("data") or {}).get("children") or []
+            for c in children:
+                if c.get("kind") != "t1":
+                    continue
+                d = c.get("data") or {}
+                body = (d.get("body") or "").strip()
+                if not body or body in _REDDIT_DEAD_BODY or _URL_ONLY_RE.match(body):
+                    continue
+                created = d.get("created_utc")
+                permalink = d.get("permalink") or ""
+                out.append({
+                    "platform_id": (d.get("id") or
+                                    hashlib.md5(body[:100].encode()).hexdigest()[:12]),
+                    "content": body[:_REDDIT_CONTENT_CHARS],
+                    "posted_at": (datetime.utcfromtimestamp(created) if created
+                                  else datetime.utcnow()),
+                    "linked_url": f"https://www.reddit.com{permalink}" if permalink else None,
+                })
+                if len(out) >= max_items:
+                    break
+        except Exception as e:
+            print(f"[scraper] Reddit comment history error for u/{username}: {e}")
+        finally:
+            browser.close()
+    return out
+
+
 async def _fetch_reddit_user(username: str, max_posts: int = 50) -> list[dict]:
     loop = asyncio.get_event_loop()
     posts = await loop.run_in_executor(None, _scrape_reddit_user_sync, username, max_posts)
@@ -2052,4 +2482,12 @@ async def _fetch_reddit_user(username: str, max_posts: int = 50) -> list[dict]:
             posts = await _fetch_reddit_user_json(username, max_posts)
         except Exception as e:
             print(f"[scraper] Reddit JSON fallback error for u/{username}: {e}")
-    return posts
+
+    # 自己的评论也算本人发言，合并后按时间排序（多数账号评论远多于发帖）
+    comments = await loop.run_in_executor(
+        None, _scrape_reddit_user_comments_sync, username, max_posts
+    )
+    if comments:
+        posts = posts + comments
+        posts.sort(key=lambda p: p.get("posted_at") or datetime.min, reverse=True)
+    return posts[:max_posts]

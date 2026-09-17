@@ -250,6 +250,29 @@ LLM_THRESHOLD = 0.70
 # GPT 核实开关：True = 所有规则命中都经过 GPT 核实（更准确，消耗更多 token）
 VERIFY_ALL = True
 
+# 规则零命中时是否仍升级到 LLM，取决于正文长度（见 _text_units）。
+# Scenario C used to return immediately whenever the regexes found nothing, so any
+# distortion the patterns did not match was invisible — forcing the LLM on five
+# r/wallstreetbets posts the pipeline scored 0 returned distortion on three. The
+# gate now escalates those too, but only when there is enough text for a judgement
+# to mean anything: a post like "AAPL 📈" or "POLL…" (1 unit) is not worth a call.
+# Raise DISTORTION_MIN_LLM_UNITS to spend less; on typical content most posts clear
+# 20 units, so a low value escalates nearly everything.
+MIN_LLM_UNITS = int(os.getenv("DISTORTION_MIN_LLM_UNITS", "12") or 12)
+
+# 中日韩文字没有空格，按字符计；其余按词计。纯字符阈值会让中文帖显得过短
+# （微博样本 131–154 字符只有 3–6 个 "词"），纯词数阈值则会把中文全部挡掉。
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _text_units(content: str) -> int:
+    """Rough count of meaningful units: CJK characters plus non-CJK words."""
+    text = content or ""
+    cjk = len(_CJK_RE.findall(text))
+    rest = _CJK_RE.sub(" ", text)
+    words = sum(1 for w in rest.split() if any(ch.isalnum() for ch in w))
+    return cjk + words
+
 
 # ── 引用检测：识别并降权引用内容 ──────────────────────────────────────────────
 
@@ -432,6 +455,129 @@ def _extract_json_object(text: str) -> str:
     return t[start:]
 
 
+def _escape_stray_quotes(text: str) -> str:
+    """Escape unescaped `"` that appear *inside* JSON string values.
+
+    Signals quote the post verbatim, and a post containing quotation marks comes
+    back with them unescaped, e.g.
+
+        "signals":["脱离英国，成立所谓"皮丁顿亲王国""]
+
+    which is unparseable. A quote genuinely ending a string is always followed
+    (after optional whitespace) by one of `,:]}` or by end of input; anything
+    else means the quote was part of the text, so escape it.
+    """
+    out: list[str] = []
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if not in_str:
+            out.append(c)
+            if c == '"':
+                in_str = True
+            continue
+        if esc:
+            out.append(c)
+            esc = False
+            continue
+        if c == "\\":
+            out.append(c)
+            esc = True
+            continue
+        if c == '"':
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j >= len(text) or text[j] in ",:]}":
+                out.append(c)
+                in_str = False
+            else:
+                out.append('\\"')     # literal quote inside the value
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+class LLMJsonError(ValueError):
+    """Raised when the model's reply cannot be parsed as the expected object.
+
+    Carries the offending payload so the caller can log it; without the raw text
+    a parse failure in production is undiagnosable (all you get is an offset).
+    """
+
+    def __init__(self, message: str, raw: str):
+        super().__init__(message)
+        self.raw = raw
+
+
+# 抢救阶段只认这几个合法类型名，避免把数组里的说明文字误当成分类结果
+_KNOWN_TYPES = ("inflate", "anxiety", "novelty", "loaded_language", "temporal")
+
+
+def _salvage_fields(candidate: str) -> dict | None:
+    """Last-resort extraction of the fields that actually drive the metrics.
+
+    When the object is structurally broken (a stray ``→``/parenthetical inside an
+    array, a missing comma) the whole reply used to be discarded, silently
+    zeroing a post the model had in fact classified. ``types`` and ``confidence``
+    are usually still intact and readable on their own; ``signals`` is cosmetic,
+    so a broken one degrades to empty rather than sinking the result.
+
+    Returns None when not even ``types`` can be recovered — a genuinely
+    unusable reply.
+    """
+    m = re.search(r'"types"\s*:\s*\[([^\]]*)\]', candidate)
+    if not m:
+        return None
+    # 只接受已知类型名，说明文字/箭头注释不会被误收
+    types = [t for t in re.findall(r'"([^"]+)"', m.group(1)) if t in _KNOWN_TYPES]
+    if not types:
+        return None
+
+    conf = None
+    mc = re.search(r'"confidence"\s*:\s*([01](?:\.\d+)?)', candidate)
+    if mc:
+        try:
+            conf = float(mc.group(1))
+        except ValueError:
+            conf = None
+
+    signals: list[str] = []
+    ms = re.search(r'"signals"\s*:\s*\[([^\]]*)\]', candidate)
+    if ms:
+        signals = re.findall(r'"([^"]+)"', ms.group(1))
+
+    out: dict = {"types": types, "signals": signals}
+    if conf is not None:
+        out["confidence"] = conf
+    return out
+
+
+def _loads_tolerant(raw: str) -> dict:
+    """Parse the model's JSON, repairing unescaped in-string quotes if needed.
+
+    Three stages, cheapest first: strict parse → escape stray in-string quotes →
+    regex-salvage the individual fields. Raises LLMJsonError (with the payload)
+    only when all three fail.
+    """
+    candidate = _extract_json_object(raw)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_escape_stray_quotes(candidate))
+    except json.JSONDecodeError as e:
+        salvaged = _salvage_fields(candidate)
+        if salvaged is not None:
+            logger.warning(
+                "LLM JSON malformed (%s); salvaged types=%s from payload: %.300s",
+                e, salvaged["types"], candidate,
+            )
+            return salvaged
+        raise LLMJsonError(f"unparseable LLM JSON: {e}", raw=candidate) from e
+
+
 async def _complete_json(
     system_prompt: str, user_message: str, max_tokens: int
 ) -> dict:
@@ -482,7 +628,7 @@ async def _complete_json(
         )
         raw = resp.choices[0].message.content or ""
 
-    return json.loads(_extract_json_object(raw))
+    return _loads_tolerant(raw)
 
 
 def _coerce_result(result: dict, fallback_confidence: float) -> dict:
@@ -554,8 +700,19 @@ False-positive guards:
 - Quantified growth stats → NOT loaded_language
 - Sports/game context → NOT loaded_language
 
-Return ONLY valid JSON:
-{"types":[...],"confidence":0.85,"signals":[...],"corrections":{"removed":[...],"added":[]}}"""
+Return ONLY valid JSON, in exactly this shape:
+{"types":["inflate"],"confidence":0.85,"signals":["exact phrase from the post"],"corrections":{"removed":[],"added":[]}}
+
+Field rules — breaking any of these makes the response unparseable and it is discarded:
+- "types", "signals", and both "corrections" arrays contain PLAIN JSON STRINGS only.
+- Put NO commentary inside an array: no "→", no parentheses, no explanation
+  trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
+  Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- Strip quotation marks from a quoted phrase — straight, curly or CJK
+  ("" '' 「」 《》). Write ["成立所谓皮丁顿亲王国"], never
+  ["成立所谓"皮丁顿亲王国""], which is unparseable.
+- "confidence" is a bare number between 0 and 1.
+- Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
     user_message = f"""Post content:
 \"{content}\"
@@ -581,17 +738,30 @@ Please verify and return the corrected classification."""
         return rule_result
 
 
-async def classify_llm_fresh(content: str) -> dict:
+async def classify_llm_fresh(content: str, fallback: dict | None = None) -> dict:
     """
     GPT 从零分类模式：规则置信度低但有命中时，让 GPT 重新判断。
+
+    fallback：LLM 不可用或解析失败时的兜底结论，通常传规则结果。
+    不传则退回空结论——仅适用于规则本来就没有命中的场景。
     """
-    if not _llm_available():
+    def _fallback(method: str) -> dict:
+        # 关键：规则已经判出的类型不能因为 LLM 出错就被丢掉，
+        # 否则一次解析失败会把「有失真」静默改写成「无失真」，
+        # 直接拉低 distortion_index 和各项 rate。
+        if fallback is not None:
+            out = dict(fallback)
+            out["method"] = method
+            return out
         return {
             "types": [],
             "confidence": 0.5,
             "signals": [],
-            "method": "llm_unavailable",
+            "method": method,
         }
+
+    if not _llm_available():
+        return _fallback("llm_unavailable")
 
     system_prompt = """You are a classifier for rhetorical distortion in social media posts.
 
@@ -607,7 +777,19 @@ Critical false-positive rules:
 - Technical severity terms → NOT loaded_language; quantified facts → NOT loaded_language
 - Only flag clear manipulative intent
 
-Return ONLY JSON: {"types":[...],"confidence":0.0-1.0,"signals":["phrase"]}"""
+Return ONLY valid JSON, in exactly this shape:
+{"types":["inflate"],"confidence":0.85,"signals":["exact phrase from the post"]}
+
+Field rules — breaking any of these makes the response unparseable and it is discarded:
+- "types" and "signals" contain PLAIN JSON STRINGS only.
+- Put NO commentary inside an array: no "→", no parentheses, no explanation
+  trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
+  Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- Strip quotation marks from a quoted phrase — straight, curly or CJK
+  ("" '' 「」 《》). Write ["成立所谓皮丁顿亲王国"], never
+  ["成立所谓"皮丁顿亲王国""], which is unparseable.
+- "confidence" is a bare number between 0 and 1.
+- Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
     _, model = _llm_provider()
     try:
@@ -618,13 +800,14 @@ Return ONLY JSON: {"types":[...],"confidence":0.0-1.0,"signals":["phrase"]}"""
         result["method"] = model
         return result
     except Exception as e:
-        logger.warning("classify_llm_fresh failed, returning empty result: %s", e)
-        return {
-            "types": [],
-            "confidence": 0.5,
-            "signals": [],
-            "method": f"llm_error:{e}",
-        }
+        raw = getattr(e, "raw", None)
+        kept = "rule result" if fallback is not None else "empty result"
+        logger.warning(
+            "classify_llm_fresh failed, falling back to %s: %s%s",
+            kept, e,
+            f" | payload: {raw[:300]}" if raw else "",
+        )
+        return _fallback(f"llm_error:{e}")
 
 
 async def classify(content: str) -> dict:
@@ -640,14 +823,21 @@ async def classify(content: str) -> dict:
     conf = rule_result["confidence"]
 
     # 场景 A：规则置信度低但有命中 → GPT 从零重判
+    # 传入规则结果兜底：LLM 挂掉时保留已经判出的类型，而不是清零
     if has_types and conf < LLM_THRESHOLD:
-        return await classify_llm_fresh(content)
+        return await classify_llm_fresh(content, fallback=rule_result)
 
     # 场景 B：规则有命中 或 有被正则排除的类型 → GPT 核实误报/漏报
     if VERIFY_ALL and (has_types or has_excluded):
         return await verify_with_gpt(content, rule_result)
 
-    # 场景 C：规则无命中且无排除 → 直接返回（置信度 1.0，无需 GPT）
+    # 场景 C：规则无命中且无排除。正文够长就仍交给 LLM 复核——正则覆盖不到的
+    # 失真只有这一条路能发现；太短则不值得一次调用，直接返回规则结果。
+    if _text_units(content) >= MIN_LLM_UNITS:
+        # 此处规则无命中，兜底即空结论，但保留规则的置信度/方法名
+        return await classify_llm_fresh(content, fallback=rule_result)
+
+    rule_result["method"] = "rules_v2_too_short"
     return rule_result
 
 
