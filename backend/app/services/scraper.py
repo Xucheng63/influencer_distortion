@@ -540,6 +540,31 @@ def _wait_twitter_timeline(page, username: str, timeout_ms: int = 45000) -> str:
     return state
 
 
+def _newest_article_date(dates: list[str]) -> str:
+    """
+    从时间轴上所有 article 的 datetime 里挑出最新的一个。
+
+    不能直接取第一条 article 的日期当「最新」：置顶推文（以及推广内容）会排在
+    时间轴最前面，日期可能是几年前的，会把新鲜的时间轴误判成过时、白白触发
+    一次整页重载（重载后置顶推依然在最前，判定不会改变）。取最大值则与
+    排列顺序无关，置顶/推广都不会拉低结果。
+
+    无法解析的日期直接跳过；全都无效时返回空串。
+    """
+    newest = ""
+    newest_dt = None
+    for iso in dates or []:
+        if not iso:
+            continue
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            continue
+        if newest_dt is None or dt > newest_dt:
+            newest_dt, newest = dt, iso
+    return newest
+
+
 def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int = 50) -> list[dict]:
     """
     用 Playwright 浏览器 + Cookie 抓取推文。
@@ -597,15 +622,16 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
             # 这里：点掉横幅 → 滚回顶部 → 若顶部推文仍很旧则整页重载一次，
             # 尽量让时间轴呈现最新推文。
             def _top_date():
+                # 读取当前 DOM 内所有 article 的 datetime，取最新的一条。
+                # 只看第一条会被置顶推文带偏（详见 _newest_article_date）。
                 try:
-                    return page.evaluate(
-                        """() => {
-                            const t = document.querySelector('article time');
-                            return t ? (t.getAttribute('datetime') || '') : '';
-                        }"""
-                    ) or ""
+                    dates = page.evaluate(
+                        """() => [...document.querySelectorAll('article time')]
+                                 .map(t => t.getAttribute('datetime') || '')"""
+                    ) or []
                 except Exception:
                     return ""
+                return _newest_article_date(dates)
 
             def _click_see_new_posts():
                 # 「See new posts」/「Show new posts」按钮：点击后加载最新推文
