@@ -455,6 +455,58 @@ def _extract_json_object(text: str) -> str:
     return t[start:]
 
 
+def _escape_stray_quotes(text: str) -> str:
+    """Escape unescaped `"` that appear *inside* JSON string values.
+
+    Signals quote the post verbatim, and a post containing quotation marks comes
+    back with them unescaped, e.g.
+
+        "signals":["脱离英国，成立所谓"皮丁顿亲王国""]
+
+    which is unparseable. A quote genuinely ending a string is always followed
+    (after optional whitespace) by one of `,:]}` or by end of input; anything
+    else means the quote was part of the text, so escape it.
+    """
+    out: list[str] = []
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if not in_str:
+            out.append(c)
+            if c == '"':
+                in_str = True
+            continue
+        if esc:
+            out.append(c)
+            esc = False
+            continue
+        if c == "\\":
+            out.append(c)
+            esc = True
+            continue
+        if c == '"':
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j >= len(text) or text[j] in ",:]}":
+                out.append(c)
+                in_str = False
+            else:
+                out.append('\\"')     # literal quote inside the value
+            continue
+        out.append(c)
+    return "".join(out)
+
+
+def _loads_tolerant(raw: str) -> dict:
+    """Parse the model's JSON, repairing unescaped in-string quotes if needed."""
+    candidate = _extract_json_object(raw)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return json.loads(_escape_stray_quotes(candidate))
+
+
 async def _complete_json(
     system_prompt: str, user_message: str, max_tokens: int
 ) -> dict:
@@ -505,7 +557,7 @@ async def _complete_json(
         )
         raw = resp.choices[0].message.content or ""
 
-    return json.loads(_extract_json_object(raw))
+    return _loads_tolerant(raw)
 
 
 def _coerce_result(result: dict, fallback_confidence: float) -> dict:
@@ -585,6 +637,9 @@ Field rules — breaking any of these makes the response unparseable and it is d
 - Put NO commentary inside an array: no "→", no parentheses, no explanation
   trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
   Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- Strip quotation marks from a quoted phrase — straight, curly or CJK
+  ("" '' 「」 《》). Write ["成立所谓皮丁顿亲王国"], never
+  ["成立所谓"皮丁顿亲王国""], which is unparseable.
 - "confidence" is a bare number between 0 and 1.
 - Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
@@ -646,6 +701,9 @@ Field rules — breaking any of these makes the response unparseable and it is d
 - Put NO commentary inside an array: no "→", no parentheses, no explanation
   trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
   Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- Strip quotation marks from a quoted phrase — straight, curly or CJK
+  ("" '' 「」 《》). Write ["成立所谓皮丁顿亲王国"], never
+  ["成立所谓"皮丁顿亲王国""], which is unparseable.
 - "confidence" is a bare number between 0 and 1.
 - Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
