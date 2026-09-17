@@ -1,0 +1,43 @@
+{
+  "tools": {
+    "distortion": {
+      "metaTitle": "System wykrywania zniekształceń influencerów — TopCited",
+      "metaDescription": "Wykrywaj skoordynowane manipulacje emocjonalne w treściach influencerów na YouTube, Twitter/X, Weibo, Bluesky i Reddit.",
+      "heroTitle": "System wykrywania zniekształceń influencerów",
+      "heroSubtitle": "Analizuj posty influencerów pod kątem skoordynowanych manipulacji emocjonalnych — inflacja, lęk, nowość, naładowany język i presja czasowa.",
+      "platformLabel": "Platforma",
+      "platform_youtube": "YouTube",
+      "platform_twitter": "Twitter / X",
+      "platform_weibo": "Weibo",
+      "platform_bluesky": "Bluesky",
+      "platform_reddit": "Reddit",
+      "handleLabel": "Nazwa użytkownika influencera lub ID kanału",
+      "handlePlaceholder": "@użytkownik lub URL kanału",
+      "analyze": "Analizuj",
+      "analyzing": "Analizowanie…",
+      "progress": "Pobieranie i ocenianie postów…",
+      "indexLabel": "Wskaźnik zniekształceń",
+      "dim_inflate": "Inflacja",
+      "dim_anxiety": "Lęk",
+      "dim_novelty": "Tendencja do nowości",
+      "dim_loaded_language": "Naładowany język",
+      "dim_temporal": "Presja czasowa",
+      "rateLimited": "Limit zapytań — poczekaj chwilę i spróbuj ponownie.",
+      "error": "Analiza nie powiodła się. Sprawdź nazwę użytkownika i spróbuj ponownie.",
+      "severityLow": "Niski sygnał zniekształceń",
+      "severityModerate": "Umiarkowany sygnał zniekształceń",
+      "severityHigh": "Wysoki sygnał zniekształceń",
+      "confidenceLabel": "Pewność:",
+      "devSectionTitle": "Deweloper: aktualizuj pliki cookie",
+      "devPasswordLabel": "Hasło dewelopera",
+      "devPasswordNote": "To pole jest tylko dla deweloperów, aby zaktualizować wygasłe pliki cookie. Zwykli użytkownicy mogą je zignorować i po prostu wpisać nazwę konta.",
+      "devUnlock": "Odblokuj",
+      "devUnlocking": "Odblokowywanie…",
+      "devPasswordError": "Nieprawidłowe hasło dewelopera.",
+      "devSaveCookies": "Zapisz pliki cookie",
+      "devSaving": "Zapisywanie…",
+      "devCookieSaved": "Pliki cookie zaktualizowane. Nowe analizy będą ich używać.",
+      "devCookieError": "Nie udało się zaktualizować plików cookie. Sprawdź wartości i spróbuj ponownie."
+    }
+  }
+}

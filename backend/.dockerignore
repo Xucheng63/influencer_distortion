@@ -1,0 +1,32 @@
+# Secrets — set these as environment variables instead
+.env
+*.env
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Tests
+tests/
+
+# SQLite databases and data dir
+*.db
+data/
+
+# macOS
+.DS_Store
+
+# One-off scripts and tests not used by the running API
+experiment_*.py
+reclassify_*.py
+rerun_*.py
+test_*.py
+debug_*.py
+find_*.py
+clear_*.py
+recompute_*.py
+compute_*.py
