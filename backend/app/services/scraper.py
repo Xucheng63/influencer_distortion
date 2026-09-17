@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib, os, re, asyncio
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import unquote
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -877,15 +878,16 @@ async def fetch_profile_info(
         if entry.get("type") == "youtube":
             return await _get_youtube_info(handle)
 
+    # 微博：weibo/{uid}、数字 uid、weibo.com 链接，或 UI 指定 weibo 时的昵称。
+    if _is_weibo_ref(handle_raw) or (platform or "").lower() == "weibo":
+        return await _get_weibo_info(handle_raw, cookies=cookies)
+
     # 任意 YouTube 频道（不在 FEED_MAP 中）：显式 URL / UC… id，或 UI 指定 youtube。
     if handle not in FEED_MAP and (
         _is_youtube_ref(handle_raw) or (platform or "").lower() == "youtube"
     ):
         return await _get_youtube_info(handle, ref=handle_raw)
         return {"handle": handle, "display_name": entry["display"], "followers": 0}
-    # 微博：weibo/{uid}
-    if _is_weibo(handle):
-        return await _get_weibo_info(handle)
     # Reddit subreddit 或 user
     if _is_reddit(handle):
         return await _get_reddit_info(handle)
@@ -974,10 +976,12 @@ async def fetch_recent_posts(
     handle_raw = handle.strip().lstrip("@").strip()
     handle = handle_raw.lower()
 
-    # ── 微博：weibo/{uid} ────────────────────────────────────────────────────
-    if _is_weibo(handle):
-        uid = handle.split("/")[1]
-        return await _fetch_weibo(uid, cookies=cookies, max_posts=50)
+    # ── 微博 ────────────────────────────────────────────────────────────────
+    # weibo/{uid}、数字 uid、weibo.com/m.weibo.cn 链接，或 UI 选定 weibo 时的昵称
+    # （昵称先经 resolve_weibo_uid 解析成 uid）。
+    if _is_weibo_ref(handle_raw) or (platform or "").lower() == "weibo":
+        uid = await resolve_weibo_uid(_weibo_query(handle_raw), cookies=cookies)
+        return await _fetch_weibo(uid, cookies=cookies, max_posts=50) if uid else []
 
     # ── Reddit subreddit 或 user ───────────────────────────────────────────────
     if _is_reddit(handle):
@@ -1313,9 +1317,34 @@ async def _fetch_bluesky(handle: str, max_posts: int = 50) -> list[dict]:
 # ── Weibo Playwright 抓取（移动端 API，无需登录）──────────────────────────────
 # handle 格式：weibo/{uid}，例如 weibo/2803301701
 
+# weibo.com/u/{uid}、weibo.com/{uid}、m.weibo.cn/u/{uid}、weibo.cn/n/{昵称}
+_WEIBO_URL_RE = re.compile(r"(?:^|//)(?:www\.|m\.)?weibo\.(?:com|cn)/(?:u/|n/)?([^/?#]+)", re.I)
+
+
 def _is_weibo(handle: str) -> bool:
     """判断是否是微博账号"""
     return handle.lower().startswith("weibo/")
+
+
+def _is_weibo_ref(handle_raw: str) -> bool:
+    """True for anything unambiguously Weibo: weibo/{uid} or a weibo.com /
+    m.weibo.cn profile URL. A bare screen name is NOT one of these — it is
+    indistinguishable from a Twitter/Substack name, so it only reaches Weibo
+    when the caller's `platform` says so.
+    """
+    h = handle_raw.strip()
+    return _is_weibo(h) or bool(_WEIBO_URL_RE.search(h))
+
+
+def _weibo_query(handle_raw: str) -> str:
+    """The uid or screen name to look up, extracted from any accepted Weibo ref."""
+    h = handle_raw.strip()
+    if _is_weibo(h):
+        return h.split("/", 1)[1].strip()
+    m = _WEIBO_URL_RE.search(h)
+    if m:
+        return unquote(m.group(1)).strip()
+    return h
 
 
 def _clean_weibo_text(raw: str) -> str:
@@ -1533,15 +1562,65 @@ async def _fetch_weibo(uid: str, cookies: dict[str, str], max_posts: int = 50) -
     return await loop.run_in_executor(None, _scrape_weibo_sync, uid, cookies, max_posts)
 
 
-async def resolve_weibo_uid(name_or_uid: str) -> str | None:
+async def _resolve_weibo_uid_desktop(name: str, cookies: dict[str, str]) -> str | None:
+    """Resolve a screen name via the logged-in desktop search endpoint."""
+    jar = {"SUB": (cookies.get("sub") or "").strip()}
+    subp = (cookies.get("subp") or "").strip()
+    if subp:
+        jar["SUBP"] = subp
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://weibo.com/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            r = await client.get(
+                "https://weibo.com/ajax/side/search",
+                params={"q": name},
+                headers=headers,
+                cookies=jar,
+                follow_redirects=True,
+            )
+            if r.status_code != 200:
+                return None
+            users = ((r.json() or {}).get("data") or {}).get("users") or []
+    except Exception as e:
+        print(f"[scraper] resolve_weibo_uid desktop({name!r}): {e}")
+        return None
+
+    # Search is fuzzy — "环球时报" also returns "环球时报文娱", a different
+    # account — so an exact screen-name match wins over ranking.
+    for u in users:
+        if (u.get("screen_name") or "").strip() == name and u.get("id"):
+            return str(u["id"])
+    return str(users[0]["id"]) if users and users[0].get("id") else None
+
+
+async def resolve_weibo_uid(
+    name_or_uid: str, cookies: dict[str, str] | None = None
+) -> str | None:
     """Resolve a Weibo username to a numeric UID.
 
-    If name_or_uid is already numeric, return it unchanged.
-    Otherwise search via m.weibo.cn/api/container/getIndex and return the
-    first matching user's UID, or None if not found.
+    If name_or_uid is already numeric, return it unchanged. Otherwise search —
+    first through the logged-in desktop endpoint, then through m.weibo.cn —
+    and return the matching user's UID, or None if not found.
     """
+    name_or_uid = (name_or_uid or "").strip()
+    if not name_or_uid:
+        return None
     if name_or_uid.isdigit():
         return name_or_uid
+
+    # Preferred path. The anonymous m.weibo.cn search below is behind the Sina
+    # Visitor System and now answers with an HTML bounce page for every query,
+    # so it only resolves anything when it is not actually needed. Kept as a
+    # fallback in case the cookies are absent or stale.
+    cookies = cookies or cookies_for_platform("weibo")
+    if (cookies.get("sub") or "").strip():
+        uid = await _resolve_weibo_uid_desktop(name_or_uid, cookies)
+        if uid:
+            return uid
 
     import json as _json
     from urllib.parse import quote as _quote
@@ -1647,9 +1726,11 @@ def _scrape_weibo_info_sync(uid: str) -> dict:
     return info
 
 
-async def _get_weibo_info(handle: str) -> dict:
+async def _get_weibo_info(handle: str, cookies: dict[str, str] | None = None) -> dict:
     """获取微博账号基本信息（昵称 + 粉丝数，UID 为标识）。"""
-    uid = handle.split("/")[1] if "/" in handle else handle
+    uid = await resolve_weibo_uid(_weibo_query(handle), cookies=cookies)
+    if not uid:
+        return {"handle": handle, "display_name": handle, "followers": 0}
     loop = asyncio.get_event_loop()
     data = await loop.run_in_executor(None, _scrape_weibo_info_sync, uid)
     return {
