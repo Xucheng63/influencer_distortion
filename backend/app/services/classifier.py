@@ -554,8 +554,16 @@ False-positive guards:
 - Quantified growth stats → NOT loaded_language
 - Sports/game context → NOT loaded_language
 
-Return ONLY valid JSON:
-{"types":[...],"confidence":0.85,"signals":[...],"corrections":{"removed":[...],"added":[]}}"""
+Return ONLY valid JSON, in exactly this shape:
+{"types":["inflate"],"confidence":0.85,"signals":["exact phrase from the post"],"corrections":{"removed":[],"added":[]}}
+
+Field rules — breaking any of these makes the response unparseable and it is discarded:
+- "types", "signals", and both "corrections" arrays contain PLAIN JSON STRINGS only.
+- Put NO commentary inside an array: no "→", no parentheses, no explanation
+  trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
+  Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- "confidence" is a bare number between 0 and 1.
+- Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
     user_message = f"""Post content:
 \"{content}\"
@@ -607,7 +615,16 @@ Critical false-positive rules:
 - Technical severity terms → NOT loaded_language; quantified facts → NOT loaded_language
 - Only flag clear manipulative intent
 
-Return ONLY JSON: {"types":[...],"confidence":0.0-1.0,"signals":["phrase"]}"""
+Return ONLY valid JSON, in exactly this shape:
+{"types":["inflate"],"confidence":0.85,"signals":["exact phrase from the post"]}
+
+Field rules — breaking any of these makes the response unparseable and it is discarded:
+- "types" and "signals" contain PLAIN JSON STRINGS only.
+- Put NO commentary inside an array: no "→", no parentheses, no explanation
+  trailing a quoted phrase. A signal is the verbatim phrase, quoted, nothing else.
+  Write ["SHOCKING"], never ["SHOCKING" → loaded_language (charged word)].
+- "confidence" is a bare number between 0 and 1.
+- Emit the JSON object alone — no notes, no reasoning, before or after it."""
 
     _, model = _llm_provider()
     try:
