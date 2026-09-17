@@ -16,10 +16,10 @@ async def test_run_analysis_computes_rates_and_index(monkeypatch):
         {"content": "post D", "posted_at": datetime(2026, 1, 4), "linked_url": None},
     ]
 
-    async def fake_profile(handle, cookies=None):
+    async def fake_profile(handle, cookies=None, platform=None):
         return {"handle": handle, "display_name": "Fake Name", "followers": 123}
 
-    async def fake_recent(handle, cookies=None, max_pages=3):
+    async def fake_recent(handle, cookies=None, max_pages=3, platform=None):
         return posts
 
     # First two posts flagged inflate, last two clean.
@@ -92,10 +92,10 @@ async def test_run_analysis_temporal_from_linked_date(monkeypatch):
         {"content": "clean", "posted_at": datetime(2026, 3, 2), "linked_url": None},
     ]
 
-    async def fake_profile(handle, cookies=None):
+    async def fake_profile(handle, cookies=None, platform=None):
         return {"handle": handle, "display_name": "N", "followers": 0}
 
-    async def fake_recent(handle, cookies=None, max_pages=3):
+    async def fake_recent(handle, cookies=None, max_pages=3, platform=None):
         return posts
 
     async def fake_classify(content):

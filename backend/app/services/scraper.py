@@ -3,7 +3,7 @@ app/services/scraper.py  —  多平台抓取器 v2
 支持: RSS/Newsletter、YouTube字幕(yt-dlp)、Twitter/X API v2
 """
 from __future__ import annotations
-import hashlib, os, asyncio
+import hashlib, os, re, asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from email.utils import parsedate_to_datetime
@@ -216,14 +216,76 @@ async def _fetch_rss(url: str) -> list[dict]:
     return _parse_rss(xml)
 
 # ── YouTube（yt-dlp，免费）────────────────────────────────────────────────────
-async def _fetch_youtube(channel_id: str, max_videos: int = 20) -> list[dict]:
+# 频道 ID 形如 UC + 22 位。大小写敏感，所以调用方必须传未经 lower() 的原始字符串。
+_YT_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_YT_TABS = ("/videos", "/shorts", "/streams", "/featured", "/about",
+            "/playlists", "/community")
+
+
+def _is_youtube_ref(ref: str) -> bool:
+    """True for an explicit YouTube reference: a channel URL or a raw UC… id.
+
+    Deliberately narrow — a bare word like "veritasium" is NOT a YouTube ref,
+    since that would swallow Twitter/Substack handles. Bare names reach YouTube
+    only via FEED_MAP or an explicit platform="youtube" from the caller.
+    """
+    r = ref.strip()
+    if _YT_ID_RE.match(r):
+        return True
+    low = r.lower()
+    return "youtube.com/" in low or "youtu.be/" in low
+
+
+def _youtube_target(ref: str) -> str:
+    """Normalize any YouTube reference to a channel /videos listing URL.
+
+    Accepts a UC… channel id, a full channel URL (@handle / channel / user /
+    legacy c/ forms, with or without a trailing tab), or a bare @handle.
+    """
+    r = ref.strip().rstrip("/")
+    low = r.lower()
+
+    if "youtube.com/" in low or "youtu.be/" in low:
+        if not low.startswith(("http://", "https://")):
+            r = "https://" + r
+        # Replace whatever tab was given with /videos.
+        for tab in _YT_TABS:
+            if r.lower().endswith(tab):
+                r = r[: -len(tab)]
+                break
+        return r + "/videos"
+
+    if _YT_ID_RE.match(r):
+        return f"https://www.youtube.com/channel/{r}/videos"
+
+    return f"https://www.youtube.com/@{r.lstrip('@')}/videos"
+
+
+def _youtube_refs(key: str, channel_id: str = "") -> list[str]:
+    """Resolution order for a FEED_MAP YouTube entry: the registry key as an
+    @handle first, the stored channel id second.
+
+    Most stored ids have gone stale and now resolve to unrelated channels
+    (mkbhd → "Gartner for Marketing"), while the registry key still matches the
+    real @handle — so the handle wins and the id is only a fallback, which
+    still covers keys that are not valid handles (e.g. "andreijikh2").
+    """
+    refs = [f"@{key.lstrip('@')}"]
+    if channel_id and channel_id not in refs:
+        refs.append(channel_id)
+    return refs
+
+
+async def _fetch_youtube(ref: str, max_videos: int = 20) -> list[dict]:
+    """Recent videos + transcripts for a channel. `ref` is anything
+    _youtube_target() accepts: a UC… id, a channel URL, or a bare handle."""
     try:
         import yt_dlp  # type: ignore
     except ImportError:
         print("[scraper] yt-dlp not installed. Run: pip install yt-dlp")
         return []
 
-    channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    channel_url = _youtube_target(ref)
     list_opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": max_videos}
 
     try:
@@ -757,42 +819,69 @@ async def _get_twitter_info(handle: str, cookies: dict[str, str] | None = None) 
     }
 
 
-async def _get_youtube_info(handle: str) -> dict:
+async def _get_youtube_info(handle: str, ref: str | None = None) -> dict:
     """YouTube 频道档案（显示名 + 订阅数）。channel_id 存于 FEED_MAP['feed']。
 
     复用 yt-dlp：频道 extract_info 顶层含 channel_follower_count（订阅数）。
     任何失败都回退到 FEED_MAP 里的显示名 + followers=0（不抛异常）。
+
+    `ref` is the caller's original (non-lowercased) handle, used for channels
+    that are not in FEED_MAP — a channel URL or a raw UC… id.
     """
     entry = FEED_MAP.get(handle, {})
     channel_id = entry.get("feed", "")
     display = entry.get("display", handle)
     followers = 0
+
     try:
         import yt_dlp  # type: ignore
-        channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
-        opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 1}
-        loop = asyncio.get_event_loop()
-        def _info():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(channel_url, download=False)
-        info = await loop.run_in_executor(None, _info)
-        followers = info.get("channel_follower_count") or 0
-        display = info.get("channel") or info.get("uploader") or display
     except ImportError:
         print("[scraper] yt-dlp not installed; YouTube followers unavailable")
-    except Exception as e:
-        print(f"[scraper] YouTube info error for {handle}: {e}")
+        return {"handle": handle, "display_name": display, "followers": followers}
+
+    # Registry entries prefer the key-as-@handle; arbitrary channels use the
+    # caller's own reference. Same order as fetch_recent_posts, so the profile
+    # and the posts always describe the same channel.
+    refs = _youtube_refs(handle, channel_id) if entry else [ref or handle]
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 1}
+    loop = asyncio.get_event_loop()
+
+    for r in refs:
+        channel_url = _youtube_target(r)
+        try:
+            def _info(url=channel_url):
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            info = await loop.run_in_executor(None, _info)
+        except Exception as e:
+            print(f"[scraper] YouTube info error for {r}: {e}")
+            continue
+        followers = info.get("channel_follower_count") or 0
+        display = info.get("channel") or info.get("uploader") or display
+        break
+
     return {"handle": handle, "display_name": display, "followers": followers}
 
 # ── 公开入口 ───────────────────────────────────────────────────────────────────
-async def fetch_profile_info(handle: str, cookies: dict[str, str] | None = None) -> dict:
+async def fetch_profile_info(
+    handle: str, cookies: dict[str, str] | None = None, platform: str | None = None
+) -> dict:
     cookies = cookies or {}
-    handle = handle.lower().strip()
+    # Channel ids are case-sensitive, so keep the original alongside the
+    # lowercased key used for FEED_MAP and the platform detectors.
+    handle_raw = handle.strip().lstrip("@").strip()
+    handle = handle_raw.lower()
     if handle in FEED_MAP:
         entry = FEED_MAP[handle]
         # YouTube 频道有订阅数，单独抓取；RSS 无粉丝概念，保持 0。
         if entry.get("type") == "youtube":
             return await _get_youtube_info(handle)
+
+    # 任意 YouTube 频道（不在 FEED_MAP 中）：显式 URL / UC… id，或 UI 指定 youtube。
+    if handle not in FEED_MAP and (
+        _is_youtube_ref(handle_raw) or (platform or "").lower() == "youtube"
+    ):
+        return await _get_youtube_info(handle, ref=handle_raw)
         return {"handle": handle, "display_name": entry["display"], "followers": 0}
     # 微博：weibo/{uid}
     if _is_weibo(handle):
@@ -864,16 +953,26 @@ async def _fetch_substack_fulltext(handle: str, max_posts: int = 20) -> list[dic
 
 
 async def fetch_recent_posts(
-    handle: str, cookies: dict[str, str] | None = None, max_pages: int = 3
+    handle: str,
+    cookies: dict[str, str] | None = None,
+    max_pages: int = 3,
+    platform: str | None = None,
 ) -> list[dict]:
     """Dispatch a recent-posts fetch by handle.
 
     `cookies` are the per-request credentials for the authenticated platforms
     (twitter → {auth_token, ct0}; weibo → {sub, subp}). Keyless platforms
     (RSS/YouTube/Reddit/Bluesky) ignore them.
+
+    `platform` is the caller's declared platform. Dispatch is still handle-led;
+    it is only consulted to send a bare handle to YouTube, which is otherwise
+    indistinguishable from a Twitter/Substack name.
     """
     cookies = cookies or {}
-    handle = handle.lower().strip()
+    # Channel ids are case-sensitive, so keep the original alongside the
+    # lowercased key used for FEED_MAP and the platform detectors.
+    handle_raw = handle.strip().lstrip("@").strip()
+    handle = handle_raw.lower()
 
     # ── 微博：weibo/{uid} ────────────────────────────────────────────────────
     if _is_weibo(handle):
@@ -887,6 +986,17 @@ async def fetch_recent_posts(
         elif handle.startswith("u/"):
             return await _fetch_reddit_user(handle[2:], max_posts=50)
 
+    # ── 任意 YouTube 频道 ─────────────────────────────────────────────────────
+    # Must precede the Bluesky branch: _is_bluesky() matches any dotted string,
+    # so "youtube.com/@x" would otherwise be taken for a Bluesky handle. Falls
+    # through on an empty result, leaving the existing fallbacks intact.
+    if handle not in FEED_MAP and (
+        _is_youtube_ref(handle_raw) or (platform or "").lower() == "youtube"
+    ):
+        posts = await _fetch_youtube(handle_raw, max_videos=20)
+        if posts:
+            return posts
+
     # ── Bluesky 账号 ──────────────────────────────────────────────────────────
     if _is_bluesky(handle) and handle not in FEED_MAP:
         return await _fetch_bluesky(handle, max_posts=50)
@@ -895,9 +1005,11 @@ async def fetch_recent_posts(
     if handle in FEED_MAP:
         entry = FEED_MAP[handle]
         if entry["type"] == "youtube":
-            posts = await _fetch_youtube(entry["feed"], max_videos=20)
-            if posts:
-                return posts
+            # @handle first, stored channel id second — see _youtube_refs().
+            for ref in _youtube_refs(handle, entry["feed"]):
+                posts = await _fetch_youtube(ref, max_videos=20)
+                if posts:
+                    return posts
             yt_rss = f"https://www.youtube.com/feeds/videos.xml?channel_id={entry['feed']}"
             return (await _fetch_rss(yt_rss))[:20]
         elif entry["type"] == "bluesky":
@@ -1038,11 +1150,14 @@ FEED_MAP.update({
     "veritasium":        {"feed": "UCHnyfMqiRRG1u-2MsSQLbXA",  "display": "Veritasium",   "type": "youtube"},
     "andrewhuang":       {"feed": "UCddiUEpeqJcYeBxX1IVBKvQ",  "display": "Andrew Huang", "type": "youtube"},
     "coldusion":         {"feed": "UC4QZ_LsYcvcq7qOsOhpAX4A",  "display": "ColdFusion",   "type": "youtube"},
-    "nandoogaming":      {"feed": "UCo8bcnLyZH8tBIH9V1mLgqQ",  "display": "Nando Gaming",     "type": "youtube"},
+    # 频道显示名是 "Nand0"，handle 是 @Nandoogaming。
+    "nandoogaming":      {"feed": "UCHbc40EdrL3X7UqUoqiaYxQ",  "display": "Nando Gaming",     "type": "youtube"},
     # ── Batch2 新增 YouTube 频道 ──────────────────────────────────────────
     "cgpgrey":           {"feed": "UC2C_jShtL725hvbm1arSV9w",  "display": "CGP Grey",          "type": "youtube"},
     "grahamstephan":     {"feed": "UCV6KDgJskWaEckne5aPA0aQ",  "display": "Graham Stephan",    "type": "youtube"},
-    "nandomovies":       {"feed": "UCo8bcnLyZH8tBIH9V1mLgqQ",  "display": "Nando v Movies",   "type": "youtube"},
+    # 真实 handle 是 @NandovMovies（非 @nandomovies，后者没有 videos tab），
+    # 所以 @handle 解析会失败，回退到这里的 channel id。
+    "nandomovies":       {"feed": "UCf29Sq6-XxLQG_XuJwMHaFg",  "display": "Nando v Movies",   "type": "youtube"},
     "linustechtips":     {"feed": "UCXuqSBlHAE6Xw-yeJA0Tunw",  "display": "Linus Tech Tips",  "type": "youtube"},
     "markrober":         {"feed": "UC7cs8q-gJRlGwj4A8OmCmXg",  "display": "Mark Rober",        "type": "youtube"},
     "teded":             {"feed": "UCY1kMZp36IQSyNx_9h4mpCg",  "display": "TED-Ed",            "type": "youtube"},
