@@ -1747,6 +1747,103 @@ REDDIT_HEADERS = {
 }
 REDDIT_API = "https://www.reddit.com"
 
+# Reddit serves this placeholder as the body of rich-media posts; it is filler,
+# not content, and classifying it produces noise.
+_REDDIT_SELFTEXT_NOISE = re.compile(
+    r"this post contains content not supported on old reddit", re.I
+)
+_REDDIT_DEAD_BODY = {"[removed]", "[deleted]"}
+_URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$")
+
+# Text budget per post. Titles alone are often a few words ("AAPL 📈"), which is
+# far too little for the classifier to judge, so the body and the top comments
+# are what give a Reddit post enough text to score.
+_REDDIT_SELFTEXT_CHARS = 600
+_REDDIT_COMMENT_CHARS = 280
+_REDDIT_MAX_COMMENTS = 5
+_REDDIT_CONTENT_CHARS = 1500
+
+
+def _reddit_clean_selftext(raw: str) -> str:
+    """A post body with Reddit's own placeholders stripped, else ""."""
+    t = (raw or "").strip()
+    if not t or t in _REDDIT_DEAD_BODY or _REDDIT_SELFTEXT_NOISE.search(t):
+        return ""
+    return t
+
+
+def _reddit_top_comments(
+    payload, max_comments: int = _REDDIT_MAX_COMMENTS
+) -> list[str]:
+    """Highest-scoring human comments from a post's `.json` payload.
+
+    The payload is `[post_listing, comment_listing]` — the comment half is what
+    the caller already downloaded and used to discard. Reddit's default ordering
+    is not by score, so sort here rather than trusting it. Skips `more` stubs,
+    stickied mod posts, AutoModerator, removed bodies, and image-only replies:
+    none carry text worth classifying.
+    """
+    if not isinstance(payload, list) or len(payload) < 2:
+        return []
+    children = ((payload[1] or {}).get("data") or {}).get("children") or []
+    scored: list[tuple[int, str]] = []
+    for c in children:
+        if c.get("kind") != "t1":
+            continue
+        d = c.get("data") or {}
+        body = (d.get("body") or "").strip()
+        if (
+            not body
+            or body in _REDDIT_DEAD_BODY
+            or d.get("stickied")
+            or d.get("author") == "AutoModerator"
+            or _URL_ONLY_RE.match(body)
+        ):
+            continue
+        scored.append((d.get("score") or 0, body))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [b[:_REDDIT_COMMENT_CHARS] for _, b in scored[:max_comments]]
+
+
+def _reddit_content(title: str, selftext: str, comments: list[str]) -> str:
+    """Assemble one post's classifiable text from title, body and comments."""
+    parts = [(title or "").strip()]
+    body = _reddit_clean_selftext(selftext)
+    if body:
+        parts.append(body[:_REDDIT_SELFTEXT_CHARS])
+    if comments:
+        parts.append("Top comments: " + " | ".join(comments))
+    # Titles usually end in their own punctuation; don't add a second period.
+    joined = ""
+    for part in (p for p in parts if p):
+        if joined:
+            joined += " " if joined[-1] in ".!?…" else ". "
+        joined += part
+    return joined[:_REDDIT_CONTENT_CHARS]
+
+
+def _reddit_detail_sync(page, post_url: str) -> tuple[str, list[str]]:
+    """One post's body and top comments, via its `.json` endpoint (Playwright).
+
+    Body and comments arrive in the same response, so the comments cost no extra
+    request — the previous code fetched them and read only the post half.
+    """
+    import json as _json
+    import time as _time
+
+    try:
+        page.goto(f"{post_url}.json?sort=top&limit=50", timeout=12000)
+        _time.sleep(1)
+        payload = _json.loads(page.evaluate("() => document.body.innerText"))
+    except Exception:
+        return "", []
+    try:
+        selftext = payload[0]["data"]["children"][0]["data"].get("selftext", "") or ""
+    except Exception:
+        selftext = ""
+    return _reddit_clean_selftext(selftext), _reddit_top_comments(payload)
+
+
 def _is_reddit(handle: str) -> bool:
     """判断是否是 Reddit 来源（r/subreddit 或 u/username）"""
     h = handle.lstrip("@").lower()
@@ -1789,9 +1886,9 @@ async def _fetch_reddit_subreddit_json(subreddit: str, max_posts: int = 50) -> l
             for child in children:
                 post = child.get("data", {})
                 title = post.get("title", "").strip()
-                selftext = post.get("selftext", "").strip()
-                # 合并标题和正文前300字
-                content = f"{title}. {selftext[:300]}" if selftext and selftext != "[removed]" else title
+                # Comments need a second request per post; this path is only the
+                # 403 fallback, so it settles for title + body.
+                content = _reddit_content(title, post.get("selftext", ""), [])
                 if not content.strip():
                     continue
 
@@ -1803,7 +1900,7 @@ async def _fetch_reddit_subreddit_json(subreddit: str, max_posts: int = 50) -> l
 
                 posts.append({
                     "platform_id": post_id or hashlib.md5(content[:100].encode()).hexdigest()[:12],
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": url,
                 })
@@ -1858,8 +1955,7 @@ async def _fetch_reddit_user_json(username: str, max_posts: int = 50) -> list[di
             for child in children:
                 post = child.get("data", {})
                 title = post.get("title", "").strip()
-                selftext = post.get("selftext", "").strip()
-                content = f"{title}. {selftext[:300]}" if selftext and selftext != "[removed]" else title
+                content = _reddit_content(title, post.get("selftext", ""), [])
                 if not content.strip():
                     continue
 
@@ -1871,7 +1967,7 @@ async def _fetch_reddit_user_json(username: str, max_posts: int = 50) -> list[di
 
                 posts.append({
                     "platform_id": post_id or hashlib.md5(content[:100].encode()).hexdigest()[:12],
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": url,
                 })
@@ -2072,26 +2168,15 @@ def _scrape_subreddit_sync(subreddit: str, max_posts: int = 50) -> list[dict]:
                 except Exception:
                     posted_dt = datetime.utcnow()
 
-                # 抓取帖子正文（访问详情页，读取 selftext）
-                selftext = ""
+                # 帖子正文 + 高分评论（同一个 .json 响应，评论不额外花请求）
+                selftext, comments = ("", [])
                 if post_url:
-                    try:
-                        page.goto(post_url + ".json", timeout=8000)
-                        time.sleep(1)
-                        body = page.evaluate("() => document.body.innerText")
-                        import json as _json
-                        data = _json.loads(body)
-                        selftext = data[0]["data"]["children"][0]["data"].get("selftext", "") or ""
-                        selftext = selftext.strip()
-                        if selftext in ("[removed]", "[deleted]"):
-                            selftext = ""
-                    except Exception:
-                        selftext = ""
+                    selftext, comments = _reddit_detail_sync(page, post_url)
 
-                content = f"{title}. {selftext[:300]}" if selftext else title
+                content = _reddit_content(title, selftext, comments)
                 posts.append({
                     "platform_id": pid,
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": post_url or None,
                 })
@@ -2194,26 +2279,16 @@ def _scrape_reddit_user_sync(username: str, max_posts: int = 50) -> list[dict]:
                 except Exception:
                     posted_dt = datetime.utcnow()
 
-                # 抓取帖子正文
+                # 帖子正文（用户自己的文字）。他人在其帖子下的评论不计入该用户的
+                # 失真分数——那是别人写的；用户自己的评论另行抓取，见 _fetch_reddit_user。
                 selftext = ""
                 if post_url:
-                    try:
-                        page.goto(post_url + ".json", timeout=8000)
-                        time.sleep(1)
-                        body = page.evaluate("() => document.body.innerText")
-                        import json as _json
-                        data = _json.loads(body)
-                        selftext = data[0]["data"]["children"][0]["data"].get("selftext", "") or ""
-                        selftext = selftext.strip()
-                        if selftext in ("[removed]", "[deleted]"):
-                            selftext = ""
-                    except Exception:
-                        selftext = ""
+                    selftext, _ = _reddit_detail_sync(page, post_url)
 
-                content = f"{title}. {selftext[:300]}" if selftext else title
+                content = _reddit_content(title, selftext, [])
                 posts.append({
                     "platform_id": pid,
-                    "content": content[:500],
+                    "content": content,
                     "posted_at": posted_dt,
                     "linked_url": post_url or None,
                 })
@@ -2238,6 +2313,70 @@ async def _fetch_reddit_subreddit(subreddit: str, max_posts: int = 50) -> list[d
     return posts
 
 
+def _scrape_reddit_user_comments_sync(username: str, max_items: int = 50) -> list[dict]:
+    """A user's own comments, from /user/{name}/comments.json (Playwright).
+
+    Their comments are their own words, so they belong in their distortion score
+    — unlike the replies *other* people leave on their posts, which is why
+    `_scrape_reddit_user_sync` drops those. Many accounts comment far more than
+    they post, so for them this is most of the signal.
+    """
+    import json as _json
+    import time as _time
+    from playwright.sync_api import sync_playwright
+
+    out: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[*CHROMIUM_LEAN_ARGS, "--disable-blink-features=AutomationControlled"],
+        )
+        page = browser.new_page(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ))
+        try:
+            # Load the HTML page first. Reddit answers a cold `.json` request with
+            # its JS anti-bot challenge page, not JSON; clearing the challenge here
+            # puts the cookie on the context so the `.json` fetch below succeeds.
+            html_url = f"https://www.reddit.com/user/{username}/comments/"
+            page.goto(html_url, wait_until="networkidle", timeout=45000)
+            if _reddit_page_is_login_wall(page) and _reddit_login(page):
+                page.goto(html_url, wait_until="networkidle", timeout=45000)
+            page.goto(
+                f"https://www.reddit.com/user/{username}/comments.json"
+                f"?sort=new&limit={min(100, max_items)}",
+                timeout=20000,
+            )
+            _time.sleep(1)
+            payload = _json.loads(page.evaluate("() => document.body.innerText"))
+            children = ((payload or {}).get("data") or {}).get("children") or []
+            for c in children:
+                if c.get("kind") != "t1":
+                    continue
+                d = c.get("data") or {}
+                body = (d.get("body") or "").strip()
+                if not body or body in _REDDIT_DEAD_BODY or _URL_ONLY_RE.match(body):
+                    continue
+                created = d.get("created_utc")
+                permalink = d.get("permalink") or ""
+                out.append({
+                    "platform_id": (d.get("id") or
+                                    hashlib.md5(body[:100].encode()).hexdigest()[:12]),
+                    "content": body[:_REDDIT_CONTENT_CHARS],
+                    "posted_at": (datetime.utcfromtimestamp(created) if created
+                                  else datetime.utcnow()),
+                    "linked_url": f"https://www.reddit.com{permalink}" if permalink else None,
+                })
+                if len(out) >= max_items:
+                    break
+        except Exception as e:
+            print(f"[scraper] Reddit comment history error for u/{username}: {e}")
+        finally:
+            browser.close()
+    return out
+
+
 async def _fetch_reddit_user(username: str, max_posts: int = 50) -> list[dict]:
     loop = asyncio.get_event_loop()
     posts = await loop.run_in_executor(None, _scrape_reddit_user_sync, username, max_posts)
@@ -2248,4 +2387,12 @@ async def _fetch_reddit_user(username: str, max_posts: int = 50) -> list[dict]:
             posts = await _fetch_reddit_user_json(username, max_posts)
         except Exception as e:
             print(f"[scraper] Reddit JSON fallback error for u/{username}: {e}")
-    return posts
+
+    # 自己的评论也算本人发言，合并后按时间排序（多数账号评论远多于发帖）
+    comments = await loop.run_in_executor(
+        None, _scrape_reddit_user_comments_sync, username, max_posts
+    )
+    if comments:
+        posts = posts + comments
+        posts.sort(key=lambda p: p.get("posted_at") or datetime.min, reverse=True)
+    return posts[:max_posts]
