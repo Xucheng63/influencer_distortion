@@ -250,6 +250,29 @@ LLM_THRESHOLD = 0.70
 # GPT 核实开关：True = 所有规则命中都经过 GPT 核实（更准确，消耗更多 token）
 VERIFY_ALL = True
 
+# 规则零命中时是否仍升级到 LLM，取决于正文长度（见 _text_units）。
+# Scenario C used to return immediately whenever the regexes found nothing, so any
+# distortion the patterns did not match was invisible — forcing the LLM on five
+# r/wallstreetbets posts the pipeline scored 0 returned distortion on three. The
+# gate now escalates those too, but only when there is enough text for a judgement
+# to mean anything: a post like "AAPL 📈" or "POLL…" (1 unit) is not worth a call.
+# Raise DISTORTION_MIN_LLM_UNITS to spend less; on typical content most posts clear
+# 20 units, so a low value escalates nearly everything.
+MIN_LLM_UNITS = int(os.getenv("DISTORTION_MIN_LLM_UNITS", "12") or 12)
+
+# 中日韩文字没有空格，按字符计；其余按词计。纯字符阈值会让中文帖显得过短
+# （微博样本 131–154 字符只有 3–6 个 "词"），纯词数阈值则会把中文全部挡掉。
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def _text_units(content: str) -> int:
+    """Rough count of meaningful units: CJK characters plus non-CJK words."""
+    text = content or ""
+    cjk = len(_CJK_RE.findall(text))
+    rest = _CJK_RE.sub(" ", text)
+    words = sum(1 for w in rest.split() if any(ch.isalnum() for ch in w))
+    return cjk + words
+
 
 # ── 引用检测：识别并降权引用内容 ──────────────────────────────────────────────
 
@@ -664,7 +687,12 @@ async def classify(content: str) -> dict:
     if VERIFY_ALL and (has_types or has_excluded):
         return await verify_with_gpt(content, rule_result)
 
-    # 场景 C：规则无命中且无排除 → 直接返回（置信度 1.0，无需 GPT）
+    # 场景 C：规则无命中且无排除。正文够长就仍交给 LLM 复核——正则覆盖不到的
+    # 失真只有这一条路能发现；太短则不值得一次调用，直接返回规则结果。
+    if _text_units(content) >= MIN_LLM_UNITS:
+        return await classify_llm_fresh(content)
+
+    rule_result["method"] = "rules_v2_too_short"
     return rule_result
 
 
