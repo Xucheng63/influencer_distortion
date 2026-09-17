@@ -459,6 +459,87 @@ def _make_twitter_context(p, cookies: dict[str, str]):
     return browser, context
 
 
+# 时间轴就绪探针：一次 evaluate 同时取回 article 与 tweetText 数量，
+# 避免分多次 eval 造成计数取自不同时刻。
+_TIMELINE_PROBE_JS = """
+    () => ({
+        articles:   document.querySelectorAll('article').length,
+        tweetTexts: document.querySelectorAll('[data-testid="tweetText"]').length,
+    })
+"""
+
+# article 已出现、但迟迟等不到 tweetText 时的宽限期（毫秒）。
+# 超过这个时间仍无正文，就认为顶部是纯媒体推文，不再干等。
+_TIMELINE_GRACE_MS = 8000
+
+
+def _timeline_state(articles: int, tweet_texts: int, ms_since_articles: float) -> str:
+    """
+    根据 DOM 计数判定时间轴是否就绪，返回：
+      ready_text       —— 已渲染出推文正文，最理想
+      ready_media_only —— article 已渲染但没有正文：顶部若全是纯图/纯视频推文，
+                          [data-testid="tweetText"] 永远不会出现（实测
+                          @realDonaldTrump 顶部 5 条均为视频推文），
+                          此时应当就绪放行，交给后续滚动收割去找带正文的推文
+      not_ready        —— 时间轴尚未渲染，继续等
+    """
+    if tweet_texts > 0:
+        return "ready_text"
+    if articles > 0 and ms_since_articles >= _TIMELINE_GRACE_MS:
+        return "ready_media_only"
+    return "not_ready"
+
+
+def _wait_twitter_timeline(page, username: str, timeout_ms: int = 45000) -> str:
+    """
+    等待 X 时间轴就绪，返回 _timeline_state 的状态字符串。
+
+    旧实现死等 [data-testid="tweetText"]：顶部全是纯媒体推文时该选择器永不出现，
+    每次都白等满 45s 再打印一条「wait timeout」假告警。改为轮询计数 +
+    宽限期判定，纯媒体顶部只需 ~8s 即可放行，且日志能区分真假异常。
+    """
+    import time as _time
+
+    deadline = _time.time() + timeout_ms / 1000
+    first_article_at: float | None = None
+    articles = tweet_texts = 0
+    state = "not_ready"
+
+    while True:
+        try:
+            counts = page.evaluate(_TIMELINE_PROBE_JS)
+            articles = int(counts.get("articles", 0))
+            tweet_texts = int(counts.get("tweetTexts", 0))
+        except Exception:
+            articles = tweet_texts = 0
+
+        if articles > 0 and first_article_at is None:
+            first_article_at = _time.time()
+        since = (_time.time() - first_article_at) * 1000 if first_article_at else 0.0
+
+        state = _timeline_state(articles, tweet_texts, since)
+        if state != "not_ready" or _time.time() >= deadline:
+            break
+        _time.sleep(0.5)
+
+    if state == "ready_text":
+        print(f"[scraper] Twitter @{username}: timeline ready — "
+              f"articles={articles} tweetText={tweet_texts}")
+    elif state == "ready_media_only":
+        print(f"[scraper] Twitter @{username}: timeline ready, top posts have no text "
+              f"(media-only) — articles={articles}; will harvest text while scrolling")
+    else:
+        # 真正的异常：时间轴始终没渲染出任何 article，附带 body 片段便于排查
+        try:
+            _body = (page.inner_text("body") or "")[:200].replace("\n", " ")
+        except Exception as _e:
+            _body = f"<body read failed: {_e}>"
+        print(f"[scraper] Twitter @{username}: timeline did not render within "
+              f"{timeout_ms}ms — articles={articles} tweetText={tweet_texts} "
+              f"body_snippet={_body!r} — continuing anyway")
+    return state
+
+
 def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int = 50) -> list[dict]:
     """
     用 Playwright 浏览器 + Cookie 抓取推文。
@@ -504,22 +585,10 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
                       f"(redirected to {page.url!r}) — cookie likely invalid or IP blocked")
                 return []
 
-            # 等待推文元素出现。按 [data-testid="tweetText"]（推文正文标记）等待，
-            # 比 article[data-testid="tweet"]（文章级 testid）更稳定；Render 实例
-            # 较慢，时间轴 hydration 需要更久，超时放宽到 45s。
-            try:
-                page.wait_for_selector('[data-testid="tweetText"]', timeout=45000)
-            except Exception:
-                # 诊断：即便超时也不直接放弃——记录现状后继续滚动收割，
-                # 时间轴可能在滚动/再等一会儿后才补齐。
-                try:
-                    _arts = page.eval_on_selector_all("article", "els => els.length")
-                    _tt = page.eval_on_selector_all('[data-testid="tweetText"]', "els => els.length")
-                    _body = (page.inner_text("body") or "")[:200].replace("\n", " ")
-                except Exception as _e:
-                    _arts, _tt, _body = "?", "?", f"<body read failed: {_e}>"
-                print(f"[scraper] Twitter @{username}: tweetText wait timeout — "
-                      f"articles={_arts} tweetText={_tt} body_snippet={_body!r} — continuing anyway")
+            # 等待时间轴就绪。不能只等 [data-testid="tweetText"]：顶部若是
+            # 纯图/纯视频推文，该选择器永远不出现，会白等满超时。Render 实例
+            # 较慢，hydration 需要更久，总超时保持 45s。
+            _wait_twitter_timeline(page, username, timeout_ms=45000)
             _time.sleep(2)
 
             # ── 强制加载最新推文 ────────────────────────────────────────────
@@ -580,7 +649,7 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
                 print(f"[scraper] Twitter @{username}: timeline looks stale, reloading")
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=120000)
-                    page.wait_for_selector('[data-testid="tweetText"]', timeout=45000)
+                    _wait_twitter_timeline(page, username, timeout_ms=45000)
                     _time.sleep(2)
                 except Exception:
                     pass
@@ -589,8 +658,8 @@ def _scrape_twitter_sync(username: str, cookies: dict[str, str], max_tweets: int
             # 旧逻辑「先滚动 6 次再一次性提取」只会拿到较旧的推文，丢失最新几条。
             # 修复：边滚边累积——每次滚动后立即提取当前 DOM 内的推文并按 url 去重。
             # 以 [data-testid="tweetText"]（推文正文）为锚点，向上找到所属 article。
-            # 不再依赖 article 自身的 data-testid="tweet"——X 的 DOM 结构时有变动，
-            # 而 tweetText 标记更稳定（Render 上实测 article 级 testid 未命中）。
+            # 无正文的纯媒体推文本就没有 tweetText，这里自然跳过——它们没有可分析
+            # 的文本，不计入结果；带正文的推文会在滚动过程中逐步进入 DOM 被收割。
             _EXTRACT_JS = """
                 () => {
                     const out = [];
